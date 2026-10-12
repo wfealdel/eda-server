@@ -50,15 +50,25 @@ class CredentialTypeSerializer(serializers.ModelSerializer):
             fields = inputs.get("fields")
             if isinstance(fields, list):
                 inputs["fields"] = list(fields)
+            metadata = inputs.get("metadata")
+            if isinstance(metadata, list):
+                inputs["metadata"] = list(metadata)
             data["inputs"] = inputs
             # Advertise CleanTextMixin Tier 2 patterns on JSON
             # sub-keys (AAP-87587).  Gated on
             # ENHANCED_INPUT_VALIDATION_ENABLED; secret fields
             # are skipped.
             inject_patterns_into_field_list(inputs.get("fields"))
+            inject_patterns_into_field_list(inputs.get("metadata"))
         return data
 
 
+# ``CredentialType.inputs`` is dynamic JSON. Its OpenAPI representation is
+# customized in ``aap_eda/api/openapi.py`` by
+# ``inject_clean_text_pattern_components`` so response schemas can document
+# the conventional field-catalog structure while create/update request
+# schemas remain free-form for generated API clients. Review that hook when
+# changing the public ``inputs`` structure.
 class CredentialTypeCreateSerializer(
     CleanTextMixin, serializers.ModelSerializer
 ):
