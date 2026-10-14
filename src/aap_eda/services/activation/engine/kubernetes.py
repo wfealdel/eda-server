@@ -64,6 +64,7 @@ POD_FAILED_REASONS = [
     IMAGE_PULL_ERROR,
 ]
 POD_DELETE_TIMEOUT = 60
+JOB_DELETE_VERIFY_TIMEOUT = 15
 
 
 @dataclass
@@ -562,14 +563,44 @@ class Engine(ContainerEngine):
         )
 
         if not (activation_job.items and activation_job.items[0].metadata):
+            self._verify_job_deleted()
             LOGGER.info(f"Job for {self.job_name} has been removed")
             return
 
         activation_job_name = activation_job.items[0].metadata.name
         self._delete_job_resource(activation_job_name, log_handler)
+        self._verify_job_deleted()
 
-    def _get_resource_version(self) -> str:
-        """Return the current resourceVersion for this job's pods."""
+    def _verify_job_deleted(self) -> None:
+        """Do not treat an untracked Job or Pod as successful cleanup."""
+        selector = f"job-name={self.job_name}"
+        deadline = time.monotonic() + JOB_DELETE_VERIFY_TIMEOUT
+        while True:
+            jobs = self._call_k8s_api(
+                self.client.batch_api.list_namespaced_job,
+                namespace=self.namespace,
+                label_selector=selector,
+                error_cls=ContainerCleanupError,
+                description=f"verify job deletion {self.job_name}",
+            )
+            pods = self._call_k8s_api(
+                self.client.core_api.list_namespaced_pod,
+                namespace=self.namespace,
+                label_selector=selector,
+                error_cls=ContainerCleanupError,
+                description=f"verify pod deletion {self.job_name}",
+            )
+            if not jobs.items and not pods.items:
+                return
+            if time.monotonic() >= deadline:
+                raise ContainerCleanupError(
+                    f"Job or Pod {self.job_name} still exists in "
+                    f"{self.namespace}"
+                )
+            time.sleep(1)
+
+    def _get_resource_version(self) -> str | None:
+        """Return a watch position only when this Job still has Pods."""
         pod_list = self._call_k8s_api(
             self.client.core_api.list_namespaced_pod,
             namespace=self.namespace,
@@ -577,7 +608,9 @@ class Engine(ContainerEngine):
             error_cls=ContainerCleanupError,
             description=f"List pods for {self.job_name}",
         )
-        return pod_list.metadata.resource_version
+        if pod_list.items:
+            return pod_list.metadata.resource_version
+        return None
 
     def _delete_job_resource(
         self, job_name: str, log_handler: LogHandler
@@ -596,9 +629,10 @@ class Engine(ContainerEngine):
         if result.status == "Failure":
             raise ContainerCleanupError(f"{result}")
 
-        self._watch_pod_deletion(
-            log_handler, resource_version=resource_version
-        )
+        if resource_version is not None:
+            self._watch_pod_deletion(
+                log_handler, resource_version=resource_version
+            )
 
     def _watch_for_deleted_event(
         self,
@@ -751,12 +785,35 @@ class Engine(ContainerEngine):
     def _set_namespace(self) -> None:
         ns_override = os.environ.get("EDA_ACTIVATION_JOB_NAMESPACE", "")
         if ns_override.strip():
-            self.namespace = ns_override.strip()
-            LOGGER.info(
-                "Using activation job namespace override: %s",
-                self.namespace,
-            )
-            return
+            namespace = ns_override.strip()
+            try:
+                # Use existing namespaced Job permissions; checking Namespace
+                # objects directly would require cluster-wide RBAC. A 403 can
+                # also mean that the namespace exists but is inaccessible.
+                self.client.batch_api.list_namespaced_job(
+                    namespace=namespace, limit=1
+                )
+            except ApiException as exc:
+                if not isinstance(exc.status, int) or not (
+                    400 <= exc.status < 500
+                ):
+                    raise ContainerEngineInitError(
+                        f"Cannot verify activation Job namespace {namespace}: "
+                        f"{exc}"
+                    ) from exc
+                LOGGER.warning(
+                    "Cannot use activation Job namespace %s (HTTP %s); "
+                    "using the worker service-account namespace instead",
+                    namespace,
+                    exc.status,
+                )
+            else:
+                self.namespace = namespace
+                LOGGER.info(
+                    "Using activation job namespace override: %s",
+                    self.namespace,
+                )
+                return
 
         namespace_file = (
             "/var/run/secrets/kubernetes.io/serviceaccount/namespace"

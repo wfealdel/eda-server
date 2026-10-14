@@ -68,6 +68,9 @@ class RulebookProcess(BaseOrgModel):
     ended_at = models.DateTimeField(null=True)
     # TODO: rename field to pod_id
     activation_pod_id = models.TextField(null=True)
+    # The namespace of this process's Kubernetes Job, not the current worker
+    # configuration. Null for historical processes and non-Kubernetes engines.
+    activation_job_namespace = models.TextField(null=True, blank=True)
     status_message = models.TextField(null=True, default=None)
     log_read_at = models.DateTimeField(null=True)
     stored_lines_since_cap_check = models.PositiveIntegerField(default=0)

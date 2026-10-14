@@ -40,6 +40,7 @@ from aap_eda.services.activation.restart_helper import (
 from .drools_cleanup import drools_cleanup
 from .engine.common import ContainerableInvalidError, ContainerEngine
 from .engine.factory import new_container_engine
+from .engine.kubernetes import Engine as KubernetesEngine
 from .status_manager import StatusManager, run_with_lock
 from .tee_system_logger import TeeSystemLogger
 
@@ -81,6 +82,26 @@ class ActivationManager(StatusManager):
             container_logger_class,
             store_debug_logs=getattr(db_instance, "store_debug_logs", False),
         )
+
+    @contextlib.contextmanager
+    def _instance_engine(self, instance):
+        """Use the Job's persisted namespace for operations on that Job."""
+        if not isinstance(self.container_engine, KubernetesEngine):
+            yield
+            return
+
+        namespace = instance.activation_job_namespace
+        if not namespace:
+            raise engine_exceptions.ContainerEngineInitError(
+                f"Process {instance.id} has no verified Job namespace. "
+                "Backfill its placement before managing the Job."
+            )
+        configured_namespace = self.container_engine.namespace
+        self.container_engine.namespace = namespace
+        try:
+            yield
+        finally:
+            self.container_engine.namespace = configured_namespace
 
     def _update_started_time(self) -> None:
         """Update latest instance's started_at to now."""
@@ -286,15 +307,16 @@ class ActivationManager(StatusManager):
         log_handler = self.container_logger_class(latest_instance.id)
 
         try:
-            self.container_engine.cleanup(
-                latest_instance.activation_pod_id,
-                log_handler,
-            )
+            with self._instance_engine(latest_instance):
+                self.container_engine.cleanup(
+                    latest_instance.activation_pod_id,
+                    log_handler,
+                )
 
-        # We don't have identified cases where we want to stop the workflow
-        # because of a cleanup error.
-        # We are just logging the error and continue.
-        except engine_exceptions.ContainerCleanupError as exc:
+        # Kubernetes replacements must not proceed if the previous Job could
+        # still exist; preserve the Job reference when cleanup is uncertain.
+        # Other engines retain their existing best-effort cleanup behavior.
+        except engine_exceptions.ContainerEngineError as exc:
             pod_id = latest_instance.activation_pod_id
             msg = (
                 f"Activation {self.db_instance.id} failed to cleanup its "
@@ -303,8 +325,10 @@ class ActivationManager(StatusManager):
             )
             LOGGER.error(msg)
             log_handler.write(msg, flush=True)
-            if raise_on_error:
-                raise
+            if raise_on_error or isinstance(
+                self.container_engine, KubernetesEngine
+            ):
+                raise engine_exceptions.ContainerCleanupError(msg) from exc
             return
 
     def _is_in_status(self, status: ActivationStatus) -> bool:
@@ -323,9 +347,10 @@ class ActivationManager(StatusManager):
 
         if pod_id:
             with contextlib.suppress(engine_exceptions.ContainerNotFoundError):
-                container_status = self.container_engine.get_status(
-                    container_id=latest_instance.activation_pod_id,
-                )
+                with self._instance_engine(latest_instance):
+                    container_status = self.container_engine.get_status(
+                        container_id=latest_instance.activation_pod_id,
+                    )
 
         if latest_instance.status != status:
             return False
@@ -1002,10 +1027,12 @@ class ActivationManager(StatusManager):
         exit early.
         """
         try:
-            return (
-                self.container_engine.get_status(
+            with self._instance_engine(self.latest_instance):
+                container_status = self.container_engine.get_status(
                     container_id=self.latest_instance.activation_pod_id,
-                ),
+                )
+            return (
+                container_status,
                 False,
             )
         except engine_exceptions.ContainerNotFoundError:
@@ -1056,10 +1083,11 @@ class ActivationManager(StatusManager):
             return
 
         try:
-            self.container_engine.update_logs(
-                container_id=self.latest_instance.activation_pod_id,
-                log_handler=log_handler,
-            )
+            with self._instance_engine(self.latest_instance):
+                self.container_engine.update_logs(
+                    container_id=self.latest_instance.activation_pod_id,
+                    log_handler=log_handler,
+                )
 
         # We don't have identified cases where we want to stop the workflow
         # because of a log error.
@@ -1089,6 +1117,8 @@ class ActivationManager(StatusManager):
             "git_hash": git_hash,
             "organization": self.db_instance.organization,
         }
+        if isinstance(self.container_engine, KubernetesEngine):
+            args["activation_job_namespace"] = self.container_engine.namespace
         args[f"{self.db_instance_type}"] = self.db_instance
         try:
             rulebook_process = models.RulebookProcess.objects.create(**args)

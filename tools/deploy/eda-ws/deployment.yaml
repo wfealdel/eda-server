@@ -35,6 +35,8 @@ spec:
               value: "['*']"
             - name: EDA_DEPLOYMENT_TYPE
               value: k8s
+            - name: EDA_WORKER_KIND
+              value: websocket
           envFrom:
           - configMapRef:
               name: eda-env-properties
