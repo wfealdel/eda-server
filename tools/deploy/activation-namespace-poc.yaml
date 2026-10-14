@@ -1,0 +1,40 @@
+# Customer-provisioned target namespace and worker access for the local
+# cross-namespace activation PoC. This file is intentionally not included in
+# tools/deploy/kustomization.yaml; apply it separately from the EDA deployment.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eda-activations
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eda-activation-worker-poc
+  namespace: eda-activations
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets", "services"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eda-activation-worker-poc
+  namespace: eda-activations
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eda-activation-worker-poc
+subjects:
+  - kind: ServiceAccount
+    name: eda-default-sa
+    namespace: aap-eda
